@@ -1,0 +1,232 @@
+---
+title: "RF&SVM on diff data transformation"
+output: html_notebook
+---
+
+
+prepare data
+```{r}
+library(readr)
+library(vegan)
+library(compositions)
+library(limma)
+library(caret)
+library(e1071)
+library(randomForest)
+library(pROC)
+library(ggplot2)
+meta_df <- read_csv("all_metadata.csv")
+metaphlan_df <- read.delim(
+  "out_full.txt",
+  sep           = "\t",
+  header        = TRUE,
+  comment.char  = "#",
+  check.names   = FALSE
+)
+#species-level only
+sp_df <- t(metaphlan_df[
+  grepl("s__", metaphlan_df$clade_name) &
+    !grepl("t__", metaphlan_df$clade_name),
+])
+colnames(sp_df) <- sp_df[1, ]
+sp_df <- sp_df[-1, ]
+sp_df2 <- data.frame(Run = rownames(sp_df), sp_df, check.names = FALSE)
+
+# Merge metadata and subset
+meta_sub <- meta_df[, c("Run", "CaseStatus", "BioProject")]
+merged_df <- merge(sp_df2, meta_sub, by = "Run")
+perio_df <- subset(merged_df, CaseStatus %in% c("periodontitis", "healthy"))
+perio_df$CaseStatus <- factor(perio_df$CaseStatus, levels = c("healthy", "periodontitis"))
+perio_df$Batch <- factor(perio_df$BioProject)
+perio_df$BioProject <- NULL
+
+# Prepare taxa matrix
+taxa_raw <- perio_df[, !(colnames(perio_df) %in% c("Run","CaseStatus","Batch"))]
+taxa_raw <- apply(taxa_raw, 2, as.numeric)
+rownames(taxa_raw) <- perio_df$Run
+cat("Total samples:", nrow(taxa_raw), "features:", ncol(taxa_raw), "\n")
+```
+Data transformations 
+
+```{r}
+
+define_transformations <- function(x) {
+  ilr_mat <- ilr(x + 1e-6);
+  colnames(ilr_mat) <- paste0("ILR", seq_len(ncol(ilr_mat)))
+  alr_mat <- alr(x + 1e-6);
+  colnames(alr_mat) <- paste0("ALR", seq_len(ncol(alr_mat)))
+  list(
+    PA     = (x > 0) * 1,
+    TSS    = sweep(x, 1, rowSums(x), `/`),
+    logTSS = log10(sweep(x,1,rowSums(x),`/`) + 1e-6),
+    aSIN   = asin(sqrt(sweep(x,1,rowSums(x),`/`))),
+    CLR    = clr(x + 1e-6),
+    rCLR   = clr(x + 1e-6, base = exp(1)),
+    ILR    = ilr_mat,
+    ALR    = alr_mat
+  )
+}
+transformed_list <- define_transformations(taxa_raw)
+cat("Defined", length(transformed_list), "transformations\n")
+
+# remove near-zero variance features
+filter_nzv <- function(mat, name) {
+  nzv <- nearZeroVar(mat)
+  if (length(nzv) == ncol(mat)) {
+    cat(name, ": all features near-zero variance, skipping.\n")
+    return(NULL)
+  }
+  if (length(nzv) > 0) {
+    cat(name, ": removed", length(nzv), "near-zero variance features.\n")
+    mat <- mat[, -nzv]
+  }
+  mat
+}
+```
+Train ML
+```{r}
+rf_models  <- list()
+svm_models <- list()
+
+# Repeated train-test splits, collect AUCs per split
+set.seed(42)
+splits <- 10
+results <- data.frame()
+for (name in names(transformed_list)) {
+  mat <- transformed_list[[name]]
+  mat <- filter_nzv(mat, name)
+  if (is.null(mat)) next
+
+  rf_models[[name]]  <- vector("list", splits)
+  svm_models[[name]] <- vector("list", splits)
+  
+  for (i in seq_len(splits)) {
+    # train/test split
+    idx <- createDataPartition(perio_df$CaseStatus, p = 0.8, list = FALSE)
+    trX <- mat[idx, ]; trY <- perio_df$CaseStatus[idx]
+    teX <- mat[-idx, ]; teY <- perio_df$CaseStatus[-idx]
+    
+    # batch correction
+    trX <- t(removeBatchEffect(t(trX), batch = perio_df$Batch[idx]))
+    teX <- t(removeBatchEffect(t(teX), batch = perio_df$Batch[-idx]))
+    
+    # trainControl
+    ctrl <- trainControl(
+      method          = "cv",
+      number          = 5,
+      classProbs      = TRUE,
+      summaryFunction = twoClassSummary
+    )
+    
+    # — SVM —
+    svm_m <- train(
+      trX, trY, 
+      method    = "svmRadial",
+      metric    = "ROC",
+      tuneLength= 5,
+      preProcess= c("center","scale"),
+      trControl = ctrl
+    )
+    # store SVM
+    svm_models[[name]][[i]] <- svm_m
+    
+    svm_prob <- predict(svm_m, teX, type = "prob")[, "periodontitis"]
+    svm_auc  <- as.numeric(auc(roc(teY, svm_prob)))
+    
+    # — RF —
+    rf_m <- train(
+      trX, trY,
+      method    = "rf",
+      metric    = "ROC",
+      tuneLength= 5,
+      trControl = ctrl
+    )
+    # store RF
+    rf_models[[name]][[i]] <- rf_m
+    
+    rf_prob <- predict(rf_m, teX, type = "prob")[, "periodontitis"]
+    rf_auc  <- as.numeric(auc(roc(teY, rf_prob)))
+    
+    # store AUC results
+    results <- rbind(results, data.frame(
+      Transformation = name,
+      Split          = i,
+      Model          = c("SVM","RF"),
+      AUC            = c(svm_auc, rf_auc)
+    ))
+  }
+}
+
+#   svm_models[["CLR"]][[3]]  — third SVM-model for CLR-transformation
+#   rf_models [["CLR"]][[3]]  — third RF-model for CLR-transformation
+
+
+```
+```{r}
+ggplot(results, aes(x = Transformation, y = AUC, fill = Model)) +
+  geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = NA) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.2), size = 1, alpha = 0.7) +
+  facet_wrap(~Model) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  ggtitle("AUC Distributions Across Splits, Transformations and Models")
+
+```
+
+
+Feature importance for RF model with variant transformation
+
+```{r}
+feature_importance <- list()
+
+for (name in names(rf_models)) {
+  # из каждого RF-моделя делаем named vector важностей
+  imp_list <- lapply(rf_models[[name]], function(m) {
+    vi <- varImp(m)$importance
+    #it returns overall 
+    if ("Overall" %in% colnames(vi)) {
+      vec <- vi[, "Overall"]
+    } else {
+      vec <- rowMeans(vi, na.rm = TRUE)
+    }
+
+    names(vec) <- rownames(vi)
+    vec
+  })
+  imp_mat  <- do.call(cbind, imp_list)
+
+
+  imp_mean <- rowMeans(imp_mat, na.rm = TRUE)
+  top20    <- sort(imp_mean, decreasing = TRUE)[1:20]
+  feature_importance[[name]] <- top20
+}
+
+#Build table
+
+transfos <- names(feature_importance)
+topN     <- 20
+
+tab <- matrix(NA_character_, nrow = topN, ncol = length(transfos),
+              dimnames = list(paste0("Rank", 1:topN), transfos))
+
+for (nm in transfos) {
+  vec_full  <- feature_importance[[nm]]
+  raw_names <- names(vec_full)
+  raw_names[is.na(raw_names)] <- "Unknown"
+  
+  # take list element after spkit by "|"
+  short_names <- sapply(strsplit(raw_names, "\\|"), function(x) tail(x, 1))
+  
+  # form cells like "species (0.123)"
+  cell_vals <- paste0(short_names, " (", sprintf("%.3f", vec_full), ")")
+  
+  tab[, nm] <- cell_vals
+}
+tab_df <- as.data.frame(tab, stringsAsFactors = FALSE)
+print(tab_df)
+
+
+
+```
+
+
