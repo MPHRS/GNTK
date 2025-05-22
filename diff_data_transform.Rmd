@@ -2,7 +2,7 @@
 title: "RF&SVM on diff data transformation"
 output: html_notebook
 ---
-
+https://microbiomejournal.biomedcentral.com/articles/10.1186/s40168-024-01996-6 --- paper with similar pipeline
 
 prepare data
 ```{r}
